@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+
+import json
+import sys
+import os
+import argparse
+import requests
+import datetime
+from time import sleep
+
+try:
+    from Cryptodome.Cipher import AES
+except ImportError:
+    from Crypto.Cipher import AES
+
+from influxdb_client import InfluxDBClient
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+DEFAULT_SMART4_URL = 'http://169.254.2.1:80'
+DEFAULT_SMART4_KEY = 'cdc0cac1280b516e674f0057e4929bca84447cca8425007e33a88a5cf598a190'
+STATUS_ROUTE = '/data/Status.json'
+
+HTTP_TIMEOUT = 5
+MAX_RETRIES = 3
+RETRY_WAIT = 3
+
+DEFAULT_INFLUX_URL = 'http://localhost:8086'
+
+MEASUREMENT_NAME = 'smart4_vdsl_status'
+REPORT_FIELDS = [ 'dsl_link_status', 'dsl_downstream', 'dsl_upstream', 'firmware_version' ]
+# Fields are strings by default. Cast these to integers and optionally divide by 1,000:
+BPS_FIELD = [ 'dsl_downstream', 'dsl_upstream' ]
+
+def http_get_encrypted_json(encryptionKey, url, params={}):
+    res = None
+    error_msg = None
+
+    for i in range(MAX_RETRIES+1):
+        try:
+            headers = { 'Accept': 'application/json' }
+            response = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+
+            try:
+                res = response.json()
+            except ValueError:
+                try:
+                    decrypted = decrypt_response(encryptionKey, response.text)
+                    res = json.loads(decrypted)
+                except ValueError as e:
+                    error_msg = "Decryption or JSON parsing failed: %s" % e
+                    eprint(error_msg)
+                    continue
+
+        except Exception as e:
+            error_msg = "Error: %s" % e
+            eprint(error_msg)
+            if i < MAX_RETRIES:
+                eprint("Will do %i. retry in %i sec(s)..." % (i+1, RETRY_WAIT ))
+                sleep(RETRY_WAIT)
+            else:
+                eprint("Maximum number of retries exceeded, giving up")
+            continue
+        break
+
+    return res, error_msg
+
+
+def decrypt_response(keyHex, data):
+    # thanks to https://stackoverflow.com/a/69054338/1387396
+
+    key = bytes.fromhex(keyHex)
+    nonce = bytes.fromhex(keyHex)[:8]
+
+    ciphertextTag = bytes.fromhex(data)
+    ciphertext = ciphertextTag[:-16]
+    tag = ciphertextTag[-16:]
+
+    cipher = AES.new(key, AES.MODE_CCM, nonce)
+    decrypted = cipher.decrypt_and_verify(ciphertext, tag)
+    return decrypted.decode('utf-8')
+
+def get_field(report, name, divide_by_thousand=False):
+    field = next((x for x in report if x['varid'] == name), None)
+    if name in BPS_FIELD:
+        value = int(field['varvalue'])
+        if divide_by_thousand:
+            return int(value / 1000)
+        return value
+    return field['varvalue']
+
+def get_vdsl_status(params):
+    url = "%s%s" % ( params.smart4_url, STATUS_ROUTE )
+
+    report, error_msg = http_get_encrypted_json(params.key, url)
+
+    if not report:
+        eprint("Failed to get status from %s" % url)
+        return None
+
+    status = {}
+    for field in REPORT_FIELDS:
+        status[field] = get_field(report, field, params.divide_by_thousand)
+
+    return status
+
+def get_data_point(vdsl_status):
+    time = get_current_utc_time()
+
+    data = [{
+        "measurement": MEASUREMENT_NAME,
+        "fields": vdsl_status,
+        "time": time
+    }]
+    return data
+
+def write_influx(params, status):
+    client = InfluxDBClient(url=params.influx_url, token=params.token, org=params.org)
+    write_api = client.write_api(write_options=SYNCHRONOUS)
+    write_api.write(bucket=params.bucket, org=params.org, record=get_data_point(status))
+
+def get_current_utc_time():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smart4-url", default=DEFAULT_SMART4_URL,
+                        help="Specify smart4 URL (defaults to %s)" % DEFAULT_SMART4_URL)
+    parser.add_argument("--key", default=DEFAULT_SMART4_KEY,
+                        help="Specify key for AES decryption (defaults to %s)" % DEFAULT_SMART4_KEY)
+    parser.add_argument("--divide-by-thousand", action='store_true',
+                        help="Divide sync values by 1,000 (newer firmware versions report in bps instead of kbps)")
+    parser.add_argument("--influx-url", default=DEFAULT_INFLUX_URL,
+                        help="Specify influx URL (defaults to %s)" % DEFAULT_INFLUX_URL)
+    parser.add_argument("--token", required=True,
+                        help="Specify influx API token")
+    parser.add_argument("--org", required=True,
+                        help="Specify influx org")
+    parser.add_argument("--bucket", required=True,
+                        help="Specify influx bucket")
+    
+    params = parser.parse_args()
+
+    status = get_vdsl_status(params)
+    
+    if not status: exit(1)
+
+    write_influx(params, status)
+
+if __name__ == '__main__':
+    main()

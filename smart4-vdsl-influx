@@ -33,7 +33,6 @@ BPS_FIELD = [ 'dsl_downstream', 'dsl_upstream' ]
 
 def http_get_encrypted_json(encryptionKey, url, params={}):
     res = None
-    error_msg = None
 
     for i in range(MAX_RETRIES+1):
         try:
@@ -62,7 +61,7 @@ def http_get_encrypted_json(encryptionKey, url, params={}):
             continue
         break
 
-    return res, error_msg
+    return res
 
 
 def decrypt_response(keyHex, data):
@@ -91,7 +90,7 @@ def get_field(report, name, divide_by_thousand=False):
 def get_vdsl_status(params):
     url = "%s%s" % ( params.smart4_url, STATUS_ROUTE )
 
-    report, error_msg = http_get_encrypted_json(params.key, url)
+    report = http_get_encrypted_json(params.key, url)
 
     if not report:
         eprint("Failed to get status from %s" % url)
@@ -140,11 +139,11 @@ def main():
                         help="Specify influx org")
     parser.add_argument("--bucket", required=True,
                         help="Specify influx bucket")
-    
+
     params = parser.parse_args()
 
     status = get_vdsl_status(params)
-    
+
     if not status: exit(1)
 
     write_influx(params, status)
